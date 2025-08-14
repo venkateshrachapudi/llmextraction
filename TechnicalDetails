@@ -1,0 +1,189 @@
+ASCII architecture (high level)
+                   +-----------------------------+
+PDF (binary) --->  | Ingestion Gateway (REST)    |  <--- Config/Schema (DB/Git)
+                   |  /extract                   |
+                   +-----+-----------------------+
+                         |
+                         v
+                 +-------+--------+
+                 |  Orchestrator  |  <-- caching (prompt->result)
+                 |  (workers/q)   |
+                 +---+---------+--+
+                     |         |
+        text/image   |         | JSON prompt w/ schema
+     +---------------+         v
+     |                         +-----------------------+
+     v                         |  LLM Extractor        |
++----+---------------------+   |  (JSON-constrained)   |
+|  PDF Parser & OCR Layer  |   +----+------------------+
+| - PyPDF2/pdfminer text   |        |
+| - (opt) OCR for scans    |        | JSON (fields->values)
++----+---------------------+        v
+     |                 +------------+---------------------------+
+     |                 |  Heuristics & Validators (regex/type) |
+     |                 |  - alias matching (Permit #, Num...)  |
+     |                 |  - proximity/regex candidates         |
+     v                 +------------+---------------------------+
++----+---------------------+       |
+| Chunker & Block Builder  |       | candidates + scores
++----+---------------------+       v
+     |                              +--------------------------+
+     | pages/blocks                 |   Ensemble & Scoring     |
+     +----------------------------> |   (merge LLM + heur.)    |
+                                    +-----------+--------------+
+                                                |
+                                                v
+                                    +-----------+--------------+
+                                    |  Output Formatter/DB     |
+                                    |  - JSON/JSONL            |
+                                    |  - (opt) Postgres/SQLite |
+                                    +-----------+--------------+
+                                                |
+                                                v
+                                       Client / Webhook / UI
+
+System design (concise but complete)
+
+Core components
+
+Ingestion Gateway (REST, FastAPI): /extract accepts pdf_b64 or raw text plus a schema (canonical field names, aliases, regex/type hints).
+
+Orchestrator/Workers: fan‑out per document; implement retry, idempotency, and caching of LLM calls (prompt hash → result).
+
+PDF Parser & OCR: PyPDF2/pdfminer for digital PDFs; Tesseract/DocTR for scanned PDFs (optional in v1).
+
+Chunker & Block Builder: page→lines→blocks, plus neighborhood windows for proximity search.
+
+Heuristics & Validators: regex for candidate values, alias matching via fuzzy header similarity; value validators per type (date, id, address).
+
+LLM Extractor: single-pass JSON‑constrained extraction with explicit schema; optionally page‑wise + global reconciliation.
+
+Ensemble & Scoring: merge LLM + heuristics; compute confidence; flag low‑confidence for review.
+
+Output & Storage: return JSON; optionally persist JSONL & metrics to SQLite/Postgres; ship to S3.
+
+Data model (minimal)
+
+extraction_job(id, created_at, status, doc_hash)
+
+field_schema(job_id, name, aliases[], type, regex)
+
+extraction_result(job_id, field_name, value, score, method, page_hint)
+
+llm_cache(prompt_hash, provider, response_json, created_at)
+
+API contract (REST)
+
+POST /extract
+
+Request:
+
+{
+  "schema": [
+    {"name":"Permit Number","aliases":["Permit #","Permit Num","PermitNumber"],"type":"string","regex":"([A-Z0-9-]{3,})"},
+    {"name":"Issue Date","aliases":["Issued On"],"type":"date","regex":"(\\d{4}-\\d{2}-\\d{2}|\\d{2}/\\d{2}/\\d{4})"}
+  ],
+  "pdf_b64": "<base64>",   // or
+  "text": "optional raw text for testing"
+}
+
+
+Response:
+
+{
+  "data": {
+    "Permit Number": {"value":"ABC-1234","score":0.92,"method":"llm|regex|proximity"},
+    "Issue Date": {"value":"2025-08-05","score":0.88,"method":"regex_header"}
+  }
+}
+
+
+Data flow
+
+Accept schema + PDF.
+
+Extract text (page‑wise). For scans, OCR to text (optional v1).
+
+Generate blocks/chunks + alias/proximity windows.
+
+Run heuristics → candidate values (+scores).
+
+Build schema‑aware prompt; call LLM (JSON‑only).
+
+Merge candidates (LLM + heuristics) → best per field + confidence.
+
+Return JSON; persist artifacts & metrics if configured.
+
+Design trade‑offs
+
+LLM vs. rules: LLMs handle variability; rules are cheap & deterministic. Use an ensemble to reduce cost and increase reliability.
+
+Single‑doc global prompt vs page‑wise prompts: global is cheaper/faster; page‑wise improves locality but costs more tokens.
+
+OCR always vs conditional: OCR only if text extraction is empty → lower cost.
+
+Alias store: static list vs learned synonyms; start with static, later auto‑learn from corrections.
+
+Scalability
+
+Stateless workers on K8s with HPA (Horizontal Pod Autoscaler).
+
+Batch pipeline for large backfills; per‑doc concurrency with token budgeting.
+
+Caching layer (prompt hash) to avoid repeat LLM spend.
+
+Shard by doc_hash for idempotency.
+
+Disaster recovery
+
+Store inputs (encrypted) + outputs in versioned object storage (e.g., S3 bucket with lifecycle).
+
+Periodic DB snapshots; infra IaC (Terraform) to recreate quickly.
+
+Dead‑letter queue for failed jobs + replay.
+
+Performance & latency
+
+Target P50 < 2–5s per doc (digital PDFs, few pages) when LLM context ≤ 20k chars.
+
+Use heuristics first; if high‑confidence, skip LLM (fast path).
+
+Page sampling for very long PDFs; escalate to full pass only if needed.
+
+Cache strategies
+
+Content‑addressed cache key: SHA‑256(pdf bytes) + schema hash.
+
+Prompt‑level cache for LLM calls; TTL configurable (e.g., 30 days).
+
+Consistency trade‑offs
+
+Eventual consistency for analytics tables; strong consistency for /extract response.
+
+Deterministic merging to ensure idempotent re‑runs.
+
+High‑volume considerations
+
+Token‑aware batching; circuit‑breakers when provider latency spikes.
+
+Pre‑filter pages by keyword (e.g., ‘permit’, ‘address’) to shrink LLM prompt.
+
+Streaming output + partial results for very big docs (optional).
+
+Back‑of‑the‑envelope
+
+1‑page digital PDFs: ~3–10KB text. Prompt+schema ~2–6KB.
+
+LLM JSON extraction call ~1 per doc (global). With 50 RPS steady state:
+
+50 RPS * ~1 call * avg 6KB ≈ 300KB/s → trivial network load.
+
+3k docs/min → horizontally scale workers; use 100–200 pods for headroom.
+
+User experience
+
+Upload PDF, choose a preset schema (Permits/Invoices/etc.) or paste your own.
+
+Show extracted fields + confidence; highlight text spans used.
+
+Let users correct values; feed back to alias store/patterns.
